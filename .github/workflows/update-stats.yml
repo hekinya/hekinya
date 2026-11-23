@@ -1,0 +1,47 @@
+name: Update Kawaii Profile Stats
+
+on:
+  schedule:
+    # 每天 UTC 00:00 和 12:00 自动刷新一次统计数据
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/generate_cards.py"
+      - "assets/**"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate Light & Dark SVG cards
+        env:
+          GITHUB_USERNAME: hekinya
+          # 默认使用内置 GITHUB_TOKEN（统计公开贡献）；如需包含私有仓库贡献，可添加名为 PROFILE_TOKEN 的 PAT
+          GITHUB_TOKEN: ${{ secrets.PROFILE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python scripts/generate_cards.py
+
+      - name: Commit updated SVG cards
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/profile-light.svg dist/profile-dark.svg
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update kawaii profile stats"
+            git push
+          fi
