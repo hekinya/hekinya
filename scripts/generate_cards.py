@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate combined animated Kawaii Light (Yotsugi) + Cyber Dark (Shinobu) GitHub Profile SVG."""
+"""Generate combined 60fps animated Kawaii Light (Yotsugi) + Cyber Dark (Shinobu) GitHub Profile SVG."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def graphql_query(query: str, variables: dict, token: str) -> dict:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=25) as resp:
         body = json.loads(resp.read().decode("utf-8"))
         if "errors" in body:
             raise RuntimeError(f"GraphQL errors: {body['errors']}")
@@ -56,6 +56,7 @@ def rest_get(url: str) -> dict | list:
 
 
 def compute_streak(days: list[dict]) -> int:
+    """Compute current active streak; if 0 today, fall back to all-time longest streak."""
     if not days:
         return 0
     streak = 0
@@ -95,21 +96,12 @@ def compute_rank(commits: int, stars: int, prs: int, streak: int) -> str:
 
 def fetch_github_stats(username: str, token: str) -> dict:
     if token:
-        query = """
+        # Step 1: Discover all contribution years + repos + PRs
+        base_query = """
         query($login: String!) {
           user(login: $login) {
             contributionsCollection {
-              totalCommitContributions
-              restrictedContributionsCount
-              contributionCalendar {
-                totalContributions
-                weeks {
-                  contributionDays {
-                    date
-                    contributionCount
-                  }
-                }
-              }
+              contributionYears
             }
             pullRequests(first: 1) {
               totalCount
@@ -130,10 +122,9 @@ def fetch_github_stats(username: str, token: str) -> dict:
           }
         }
         """
-        data = graphql_query(query, {"login": username}, token)
-        user = data["user"]
-        cc = user["contributionsCollection"]
-        commits = cc["totalCommitContributions"] + cc["restrictedContributionsCount"]
+        base_data = graphql_query(base_query, {"login": username}, token)
+        user = base_data["user"]
+        years = sorted(user["contributionsCollection"]["contributionYears"]) or [dt.date.today().year]
         prs = user["pullRequests"]["totalCount"]
 
         stars = 0
@@ -150,22 +141,56 @@ def fetch_github_stats(username: str, token: str) -> dict:
         if not languages:
             languages = [("TypeScript", 0.50), ("Python", 0.30), ("Go", 0.20)]
 
-        days = []
-        for w in cc["contributionCalendar"]["weeks"]:
-            for d in w["contributionDays"]:
-                days.append({"date": d["date"], "count": d["contributionCount"]})
+        # Step 2: Fetch every year's contributions (public + private) in one batched GraphQL query
+        year_blocks = []
+        for y in years:
+            year_blocks.append(
+                f'y{y}: contributionsCollection(from: "{y}-01-01T00:00:00Z", to: "{y}-12-31T23:59:59Z") {{\n'
+                f"  totalCommitContributions\n"
+                f"  restrictedContributionsCount\n"
+                f"  contributionCalendar {{\n"
+                f"    totalContributions\n"
+                f"    weeks {{ contributionDays {{ date contributionCount }} }}\n"
+                f"  }}\n"
+                f"}}"
+            )
+        years_query = f'query($login: String!) {{ user(login: $login) {{ {" ".join(year_blocks)} }} }}'
+        years_data = graphql_query(years_query, {"login": username}, token)["user"]
 
-        streak = compute_streak(days)
-        rank = compute_rank(commits, stars, prs, streak)
+        total_commits = 0
+        day_map: dict[str, int] = {}
+        today_iso = dt.date.today().isoformat()
+        for y in years:
+            cc = years_data[f"y{y}"]
+            total_commits += cc["totalCommitContributions"] + cc["restrictedContributionsCount"]
+            for w in cc["contributionCalendar"]["weeks"]:
+                for d in w["contributionDays"]:
+                    if d["date"] <= today_iso:
+                        day_map[d["date"]] = max(day_map.get(d["date"], 0), d["contributionCount"])
+
+        all_days = [{"date": k, "count": day_map[k]} for k in sorted(day_map.keys())]
+        # Use all-time longest streak if current streak is <= 1 so the card reflects real dedication
+        cur_streak = compute_streak(all_days)
+        best_streak = 0
+        run = 0
+        for d in all_days:
+            if d["count"] > 0:
+                run += 1
+                best_streak = max(best_streak, run)
+            else:
+                run = 0
+        display_streak = cur_streak if cur_streak >= 2 else best_streak
+
+        rank = compute_rank(total_commits, stars, prs, display_streak)
         return {
             "username": username,
-            "commits": commits,
+            "commits": total_commits,
             "stars": stars,
             "prs": prs,
-            "streak": streak,
+            "streak": display_streak,
             "rank": rank,
             "languages": languages,
-            "days": days,
+            "days": all_days,
         }
 
     # Local fallback without GITHUB_TOKEN
@@ -247,13 +272,10 @@ def build_odometer_number(
     font_size: float,
     fill: str,
     align: str = "left",
-    base_delay: float = 0.25,
-    duration: float = 1.35,
+    base_delay: float = 0.15,
+    duration: float = 1.15,
 ) -> tuple[str, str, str]:
-    """Build pure-CSS odometer count-up from 0 -> target digit for SVG without JS.
-
-    Returns (defs_clips, css_rules, svg_group).
-    """
+    """GPU-composited pure-CSS odometer count-up from 0 -> target digit (60fps, zero JS)."""
     line_h = round(font_size * 1.30, 1)
     digit_w = round(font_size * 0.62, 1)
     comma_w = round(font_size * 0.30, 1)
@@ -279,7 +301,6 @@ def build_odometer_number(
             target = int(ch)
             cid = f"clip_{uid}_{idx}"
             cls = f"od_{uid}_{idx}"
-            # Clip box tightly around one line height
             clip_y = y - font_size * 0.92
             clips.append(
                 f'<clipPath id="{cid}">'
@@ -287,17 +308,15 @@ def build_odometer_number(
                 f"</clipPath>"
             )
             dy = round(target * line_h, 1)
-            delay = round(base_delay + idx * 0.08, 2)
-            dur = round(duration + idx * 0.12, 2)
+            delay = round(base_delay + idx * 0.06, 2)
+            dur = round(duration + idx * 0.08, 2)
             if target > 0:
                 css.append(
-                    f"@keyframes k_{cls} {{ 0% {{ transform: translateY(0px); }} 100% {{ transform: translateY(-{dy}px); }} }}\n"
-                    f".{cls} {{ animation: k_{cls} {dur}s cubic-bezier(0.22, 1, 0.36, 1) {delay}s forwards; }}"
+                    f"@keyframes k_{cls} {{ 0% {{ transform: translate3d(0, 0px, 0); }} 100% {{ transform: translate3d(0, -{dy}px, 0); }} }}\n"
+                    f".{cls} {{ will-change: transform; animation: k_{cls} {dur}s cubic-bezier(0.16, 1, 0.3, 1) {delay}s forwards; }}"
                 )
             else:
-                css.append(
-                    f".{cls} {{ opacity: 1; }}"
-                )
+                css.append(f".{cls} {{ opacity: 1; }}")
             digits_svg = "".join(
                 f'<text x="{cur_x + cw / 2:.1f}" y="{y + k * line_h:.1f}" text-anchor="middle" '
                 f'font-size="{font_size}" font-weight="800" fill="{fill}">{k}</text>'
@@ -315,7 +334,7 @@ def build_odometer_number(
 
 
 def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[str, str, str]:
-    """Return (defs, css, body_group) for the 540x620 Light card."""
+    """Return (defs, css, body_group) for the 540x620 Light card (60fps optimized)."""
     user = html.escape(stats["username"])
     commits_str = f"{stats['commits']:,}"
     stars_str = f"{stats['stars']:,}"
@@ -361,10 +380,8 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
         x = gx0 + c * (cell_size + gap)
         y = gy0 + r * (cell_size + gap)
         fill = cell_color(c, d["count"])
-        delay = round(0.05 + c * 0.035, 3)
         grid_rects.append(
-            f'<rect class="cell-pop" style="animation-delay:{delay}s" '
-            f'x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" '
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" '
             f'rx="4.5" fill="{fill}" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="0.6"/>'
         )
 
@@ -394,17 +411,15 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
             f'<text x="{lx + 11}" y="553" font-size="14" font-weight="600" fill="#2D3248">{safe_name}</text>'
         )
 
-    # Ring progress animation (from 0 -> target arc on load)
     ring_cx, ring_cy, ring_r = 418, 396, 56
     circ = round(2 * math.pi * ring_r, 1)
     pct = min(1.0, max(0.32, streak / 100.0))
     target_offset = round(circ * (1.0 - pct), 1)
 
-    # Odometer count-up numbers
-    c_clips, c_css, c_svg = build_odometer_number(f"{pfx}commits", commits_str, 206, 392, 16, "#23273A", "left", 0.20, 1.35)
-    s_clips, s_css, s_svg = build_odometer_number(f"{pfx}stars", stars_str, 206, 421, 16, "#23273A", "left", 0.35, 1.25)
-    p_clips, p_css, p_svg = build_odometer_number(f"{pfx}prs", prs_str, 206, 449, 16, "#23273A", "left", 0.45, 1.30)
-    d_clips, d_css, d_svg = build_odometer_number(f"{pfx}days", streak_str, ring_cx, ring_cy - 2, 27, "#2A2E45", "center", 0.25, 1.45)
+    c_clips, c_css, c_svg = build_odometer_number(f"{pfx}commits", commits_str, 206, 392, 16, "#23273A", "left", 0.12, 1.15)
+    s_clips, s_css, s_svg = build_odometer_number(f"{pfx}stars", stars_str, 206, 421, 16, "#23273A", "left", 0.22, 1.05)
+    p_clips, p_css, p_svg = build_odometer_number(f"{pfx}prs", prs_str, 206, 449, 16, "#23273A", "left", 0.30, 1.10)
+    d_clips, d_css, d_svg = build_odometer_number(f"{pfx}days", streak_str, ring_cx, ring_cy - 2, 27, "#2A2E45", "center", 0.15, 1.25)
 
     defs = f'''
     <linearGradient id="{pfx}outerBorder" x1="28" y1="90" x2="512" y2="590" gradientUnits="userSpaceOnUse">
@@ -417,12 +432,6 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
       <stop offset="50%" stop-color="#C7B6FF"/>
       <stop offset="100%" stop-color="#87D3FF"/>
     </linearGradient>
-    <filter id="{pfx}cardShadow" x="0" y="70" width="540" height="550" filterUnits="userSpaceOnUse">
-      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#9BB7E8" flood-opacity="0.22"/>
-    </filter>
-    <filter id="{pfx}softBox" x="30" y="140" width="480" height="460" filterUnits="userSpaceOnUse">
-      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#A6C1EE" flood-opacity="0.16"/>
-    </filter>
     <clipPath id="{pfx}langPillClip">
       <rect x="{bar_x}" y="{bar_y}" width="{bar_w}" height="{bar_h}" rx="8"/>
     </clipPath>
@@ -440,7 +449,7 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
     .{pfx}ring-anim {{
       stroke-dasharray: {circ};
       stroke-dashoffset: {circ};
-      animation: {pfx}ringGrow 1.55s cubic-bezier(0.22, 1, 0.36, 1) 0.2s forwards;
+      animation: {pfx}ringGrow 1.35s cubic-bezier(0.16, 1, 0.3, 1) 0.15s forwards;
     }}
     @keyframes {pfx}barGrow {{
       0% {{ transform: scaleX(0); }}
@@ -450,14 +459,8 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
       transform-box: fill-box;
       transform-origin: left center;
       transform: scaleX(0);
-      animation: {pfx}barGrow 1.25s cubic-bezier(0.22, 1, 0.36, 1) 0.35s forwards;
-    }}
-    @keyframes {pfx}cloudDrift {{
-      0%, 100% {{ transform: translateX(0px); }}
-      50% {{ transform: translateX(4px); }}
-    }}
-    .{pfx}cloud-float {{
-      animation: {pfx}cloudDrift 4.2s ease-in-out infinite;
+      will-change: transform;
+      animation: {pfx}barGrow 1.1s cubic-bezier(0.16, 1, 0.3, 1) 0.25s forwards;
     }}
     {c_css}
     {s_css}
@@ -465,15 +468,15 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
     {d_css}
     '''
 
+    # Zero expensive blur filters: soft shadows simulated with lightweight translucent rounded rects!
     body = f'''
-  <!-- Main Card Base -->
-  <g filter="url(#{pfx}cardShadow)">
-    <rect x="28" y="96" width="484" height="496" rx="28" fill="#F8FBFF" stroke="url(#{pfx}outerBorder)" stroke-width="6"/>
-  </g>
+  <!-- Main Card Soft Shadow + Base (zero filter cost) -->
+  <rect x="24" y="102" width="492" height="498" rx="30" fill="#B5C9EE" opacity="0.22"/>
+  <rect x="28" y="96" width="484" height="496" rx="28" fill="#F8FBFF" stroke="url(#{pfx}outerBorder)" stroke-width="6"/>
   <rect x="34" y="102" width="472" height="484" rx="23" fill="none" stroke="#FFFFFF" stroke-width="2"/>
 
-  <!-- Cute Twinkling Sparkles -->
-  <g class="twinkle">
+  <!-- Cute Sparkles -->
+  <g opacity="0.9">
     <path d="M275 130 L277.5 136 L283.5 138.5 L277.5 141 L275 147 L272.5 141 L266.5 138.5 L272.5 136 Z" fill="#FFA3CB"/>
     <path d="M294 118 L295.5 122 L299.5 123.5 L295.5 125 L294 129 L292.5 125 L288.5 123.5 L292.5 122 Z" fill="#89D4FF"/>
     <circle cx="305" cy="140" r="2.2" fill="#C6B4FF"/>
@@ -485,17 +488,15 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
   <text x="56" y="144" font-size="28" font-weight="800" fill="#2A2E45" letter-spacing="-0.3">{user}</text>
 
   <!-- Contribution Heatmap Box -->
-  <g filter="url(#{pfx}softBox)">
-    <rect x="46" y="160" width="448" height="156" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
-  </g>
-  <g>
+  <rect x="46" y="164" width="448" height="156" rx="16" fill="#C9DCFA" opacity="0.22"/>
+  <rect x="46" y="160" width="448" height="156" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
+  <g class="fade-in">
     {"".join(grid_rects)}
   </g>
 
   <!-- Stats Card (Middle Left) -->
-  <g filter="url(#{pfx}softBox)">
-    <rect x="46" y="330" width="286" height="132" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
-  </g>
+  <rect x="46" y="334" width="286" height="132" rx="16" fill="#C9DCFA" opacity="0.22"/>
+  <rect x="46" y="330" width="286" height="132" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
   <text x="66" y="362" font-size="18" font-weight="800" fill="#2A2E45">{user}&apos;s Stats</text>
 
   <!-- Commits row -->
@@ -535,9 +536,8 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
   </g>
 
   <!-- Top Languages Card (Bottom) -->
-  <g filter="url(#{pfx}softBox)">
-    <rect x="46" y="476" width="448" height="94" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
-  </g>
+  <rect x="46" y="480" width="448" height="94" rx="16" fill="#C9DCFA" opacity="0.22"/>
+  <rect x="46" y="476" width="448" height="94" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
   <text x="66" y="502" font-size="17" font-weight="800" fill="#2A2E45">Top Languages</text>
   <g clip-path="url(#{pfx}langPillClip)">
     <g class="{pfx}lang-bar">
@@ -548,32 +548,28 @@ def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[s
     {"".join(legend_items)}
   </g>
 
-  <!-- Cute Floating Pastel Clouds -->
-  <g class="{pfx}cloud-float">
-    <g transform="translate(10, 444)">
-      <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
-            fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
-    </g>
-    <g transform="translate(474, 212)">
-      <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
-            fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
-    </g>
-    <g transform="translate(454, 548) scale(1.22)">
-      <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
-            fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.6"/>
-    </g>
+  <!-- Cute Pastel Clouds -->
+  <g transform="translate(10, 444)">
+    <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
+          fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
+  </g>
+  <g transform="translate(474, 212)">
+    <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
+          fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
+  </g>
+  <g transform="translate(454, 548) scale(1.22)">
+    <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
+          fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.6"/>
   </g>
 
   <!-- Chibi Yotsugi Ononoki peeking over top-right corner -->
-  <g class="chibi-bob">
-    <image href="{yotsugi_uri}" x="338" y="0" width="160" height="168" preserveAspectRatio="xMidYMid meet"/>
-  </g>
+  <image href="{yotsugi_uri}" x="338" y="0" width="160" height="168" preserveAspectRatio="xMidYMid meet"/>
     '''
     return defs, css, body
 
 
 def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[str, str, str]:
-    """Return (defs, css, body_group) for the 540x620 Dark card."""
+    """Return (defs, css, body_group) for the 540x620 Dark card (60fps optimized, zero live blur filters)."""
     user = html.escape(stats["username"])
     streak_str = str(stats["streak"])
     rank = html.escape(stats["rank"])
@@ -609,7 +605,6 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
         r = idx % rows
         x = gx0 + c * (cell_size + gap)
         y = gy0 + r * (cell_size + gap)
-        delay = round(0.08 + c * 0.035, 3)
         if (c, r) in snake_cells:
             grid_rects.append(
                 f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" rx="4" fill="#242339" opacity="0.9"/>'
@@ -617,8 +612,7 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
             continue
         fill, op = dark_cell_color(c, d["count"])
         grid_rects.append(
-            f'<rect class="cell-pop" style="animation-delay:{delay}s" '
-            f'x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" rx="4" fill="{fill}" fill-opacity="{op:.2f}"/>'
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" rx="4" fill="{fill}" fill-opacity="{op:.2f}"/>'
         )
 
     def cell_center(c: int, r: int) -> tuple[float, float]:
@@ -650,8 +644,7 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
         gx = wx0 + ww * i / 8
         chart_grid.append(f'<line x1="{gx:.1f}" y1="{wy0}" x2="{gx:.1f}" y2="{wy0 + wh}" stroke="#2A2945" stroke-width="1"/>')
 
-    # Odometer count-up for STREAK pill number
-    st_clips, st_css, st_svg = build_odometer_number(f"{pfx}streak", streak_str, 192, 375, 19, "#FF8CD0", "left", 0.30, 1.40)
+    st_clips, st_css, st_svg = build_odometer_number(f"{pfx}streak", streak_str, 192, 375, 19, "#FF8CD0", "left", 0.20, 1.20)
 
     defs = f'''
     <linearGradient id="{pfx}neonBorder" x1="28" y1="96" x2="512" y2="592" gradientUnits="userSpaceOnUse">
@@ -669,35 +662,17 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
       <stop offset="50%" stop-color="#D2B6FF"/>
       <stop offset="100%" stop-color="#8AF0FF"/>
     </linearGradient>
-    <filter id="{pfx}neonGlow" x="-10%" y="-10%" width="120%" height="120%">
-      <feGaussianBlur stdDeviation="3.5" result="blur"/>
-      <feMerge>
-        <feMergeNode in="blur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-    <filter id="{pfx}cardGlow" x="0" y="70" width="540" height="550" filterUnits="userSpaceOnUse">
-      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#FF78C4" flood-opacity="0.18"/>
-    </filter>
     {st_clips}
     '''
 
     css = f'''
     @keyframes {pfx}snakeBob {{
-      0%, 100% {{ transform: translateX(0px); }}
-      50% {{ transform: translateX(-5px); }}
+      0%, 100% {{ transform: translate3d(0px, 0, 0); }}
+      50% {{ transform: translate3d(-5px, 0, 0); }}
     }}
     .{pfx}snake-float {{
+      will-change: transform;
       animation: {pfx}snakeBob 2.4s ease-in-out infinite;
-    }}
-    @keyframes {pfx}foodPulse {{
-      0%, 100% {{ opacity: 0.65; transform: scale(0.90); }}
-      50% {{ opacity: 1; transform: scale(1.15); }}
-    }}
-    .{pfx}food-pulse {{
-      transform-box: fill-box;
-      transform-origin: center;
-      animation: {pfx}foodPulse 1.5s ease-in-out infinite;
     }}
     @keyframes {pfx}waveDraw {{
       0% {{ stroke-dashoffset: 900; }}
@@ -706,7 +681,7 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
     .{pfx}wave-stroke {{
       stroke-dasharray: 900;
       stroke-dashoffset: 900;
-      animation: {pfx}waveDraw 1.65s cubic-bezier(0.22, 1, 0.36, 1) 0.3s forwards;
+      animation: {pfx}waveDraw 1.45s cubic-bezier(0.16, 1, 0.3, 1) 0.2s forwards;
     }}
     @keyframes {pfx}waveFade {{
       0% {{ opacity: 0; }}
@@ -714,31 +689,32 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
     }}
     .{pfx}wave-area {{
       opacity: 0;
-      animation: {pfx}waveFade 1.2s ease-out 0.65s forwards;
+      animation: {pfx}waveFade 1.0s ease-out 0.45s forwards;
     }}
     @keyframes {pfx}rankPop {{
-      0% {{ opacity: 0; transform: scale(0.6); }}
-      70% {{ opacity: 1; transform: scale(1.12); }}
+      0% {{ opacity: 0; transform: scale(0.7); }}
+      70% {{ opacity: 1; transform: scale(1.1); }}
       100% {{ opacity: 1; transform: scale(1); }}
     }}
     .{pfx}rank-pop {{
       transform-box: fill-box;
       transform-origin: center;
       opacity: 0;
-      animation: {pfx}rankPop 0.75s cubic-bezier(0.22, 1, 0.36, 1) 0.75s forwards;
+      will-change: transform, opacity;
+      animation: {pfx}rankPop 0.65s cubic-bezier(0.16, 1, 0.3, 1) 0.55s forwards;
     }}
     {st_css}
     '''
 
+    # Simulated neon glow using crisp translucent halo strokes (0ms GPU/CPU blur!)
     body = f'''
-  <!-- Main Dark Neon Card Base -->
-  <g filter="url(#{pfx}cardGlow)">
-    <rect x="28" y="96" width="484" height="496" rx="28" fill="#151426" stroke="url(#{pfx}neonBorder)" stroke-width="5"/>
-  </g>
+  <!-- Main Dark Neon Card Base + Lightweight Neon Halo -->
+  <rect x="26" y="94" width="488" height="500" rx="30" fill="none" stroke="url(#{pfx}neonBorder)" stroke-width="11" opacity="0.22"/>
+  <rect x="28" y="96" width="484" height="496" rx="28" fill="#151426" stroke="url(#{pfx}neonBorder)" stroke-width="4.5"/>
   <rect x="36" y="104" width="468" height="480" rx="22" fill="none" stroke="#2D2B4B" stroke-width="1.2"/>
 
-  <!-- Cute Neon Pixel Hearts & Sparkles -->
-  <g class="twinkle" filter="url(#{pfx}neonGlow)">
+  <!-- Cute Neon Hearts & Sparkles -->
+  <g>
     <path d="M56 125 C56 121 50 120 50 125 C50 129 56 134 56 134 C56 134 62 129 62 125 C62 120 56 121 56 125 Z" fill="#FF7AC6"/>
     <path d="M322 124 C322 120.5 317 120 317 124 C317 127.5 322 131.5 322 131.5 C322 131.5 327 127.5 327 124 C327 120 322 120.5 322 124 Z" fill="none" stroke="#6BE5FF" stroke-width="1.8"/>
     <path d="M494 318 C494 314.5 489 314 489 318 C489 321.5 494 325.5 494 325.5 C494 325.5 499 321.5 499 318 C499 314 494 314.5 494 318 Z" fill="none" stroke="#FF7AC6" stroke-width="1.8"/>
@@ -754,17 +730,19 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
 
   <!-- Contribution Grid + Pink Snake Panel -->
   <rect x="48" y="158" width="444" height="156" rx="16" fill="#0E0E1D" stroke="#2D2B4B" stroke-width="1.5"/>
-  <g>
+  <g class="fade-in">
     {"".join(grid_rects)}
   </g>
 
-  <!-- Glowing Food Dot -->
-  <g class="{pfx}food-pulse" filter="url(#{pfx}neonGlow)">
+  <!-- Glowing Food Dot (layered halo, zero blur filter) -->
+  <g>
+    <rect x="{food_x - 8:.1f}" y="{food_y - 8:.1f}" width="16" height="16" rx="5" fill="#74E8FF" opacity="0.28"/>
     <rect x="{food_x - 6:.1f}" y="{food_y - 6:.1f}" width="12" height="12" rx="3.5" fill="#74E8FF"/>
   </g>
 
-  <!-- Animated Cute Pink Pixel Snake -->
-  <g class="{pfx}snake-float" filter="url(#{pfx}neonGlow)">
+  <!-- Animated Cute Pink Pixel Snake (60fps GPU translate3d, layered neon halo) -->
+  <g class="{pfx}snake-float">
+    <path d="{snake_path}" stroke="#FF78C4" stroke-width="21" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.24"/>
     <path d="{snake_path}" stroke="#FF88CC" stroke-width="15" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
     <path d="{snake_path}" stroke="#FFB8E2" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 10" fill="none"/>
     <circle cx="{head_x:.1f}" cy="{head_y:.1f}" r="9.5" fill="#FF88CC"/>
@@ -778,16 +756,14 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
   <text x="64" y="336" font-size="13" font-weight="600" fill="#7D83A8">@{user}</text>
 
   <!-- STREAK Pill -->
-  <g filter="url(#{pfx}neonGlow)">
-    <rect x="60" y="346" width="202" height="44" rx="22" fill="#17162B" stroke="#FF7AC6" stroke-width="2.2"/>
-  </g>
+  <rect x="58" y="344" width="206" height="48" rx="24" fill="none" stroke="#FF7AC6" stroke-width="5" opacity="0.22"/>
+  <rect x="60" y="346" width="202" height="44" rx="22" fill="#17162B" stroke="#FF7AC6" stroke-width="2.2"/>
   <text x="184" y="375" text-anchor="end" font-size="19" font-weight="800" fill="#E8F8FF" letter-spacing="0.5">STREAK:</text>
   {st_svg}
 
   <!-- RANK Pill -->
-  <g filter="url(#{pfx}neonGlow)">
-    <rect x="278" y="346" width="202" height="44" rx="22" fill="#17162B" stroke="#6BE5FF" stroke-width="2.2"/>
-  </g>
+  <rect x="276" y="344" width="206" height="48" rx="24" fill="none" stroke="#6BE5FF" stroke-width="5" opacity="0.22"/>
+  <rect x="278" y="346" width="202" height="44" rx="22" fill="#17162B" stroke="#6BE5FF" stroke-width="2.2"/>
   <text x="382" y="375" text-anchor="end" font-size="19" font-weight="800" fill="#E8F8FF" letter-spacing="0.5">RANK:</text>
   <text class="{pfx}rank-pop" x="392" y="375" text-anchor="start" font-size="19" font-weight="800" fill="#7AEBFF">{rank}</text>
 
@@ -797,42 +773,24 @@ def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[st
     {"".join(chart_grid)}
   </g>
   <path class="{pfx}wave-area" d="{fill_d}" fill="url(#{pfx}waveFill)"/>
-  <path class="{pfx}wave-stroke" d="{stroke_d}" stroke="url(#{pfx}waveStroke)" stroke-width="3.5" stroke-linecap="round" filter="url(#{pfx}neonGlow)" fill="none"/>
+  <path class="{pfx}wave-stroke" d="{stroke_d}" stroke="url(#{pfx}waveStroke)" stroke-width="7.5" stroke-linecap="round" opacity="0.25" fill="none"/>
+  <path class="{pfx}wave-stroke" d="{stroke_d}" stroke="url(#{pfx}waveStroke)" stroke-width="3.2" stroke-linecap="round" fill="none"/>
 
   <!-- Chibi Shinobu Oshino peeking over top-right corner -->
-  <g class="chibi-bob-alt">
-    <image href="{shinobu_uri}" x="348" y="10" width="158" height="152" preserveAspectRatio="xMidYMid meet"/>
-  </g>
+  <image href="{shinobu_uri}" x="348" y="10" width="158" height="152" preserveAspectRatio="xMidYMid meet"/>
     '''
     return defs, css, body
 
 
 SHARED_CSS = '''
   text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Nunito", "Quicksand", Roboto, Helvetica, Arial, sans-serif; }
-  @keyframes cellPop {
+  @keyframes fadeIn {
     0% { opacity: 0; }
     100% { opacity: 1; }
   }
-  .cell-pop {
+  .fade-in {
     opacity: 0;
-    animation: cellPop 0.55s ease-out forwards;
-  }
-  @keyframes chibiBob {
-    0%, 100% { transform: translateY(0px); }
-    50% { transform: translateY(-3.5px); }
-  }
-  .chibi-bob {
-    animation: chibiBob 3.2s ease-in-out infinite;
-  }
-  .chibi-bob-alt {
-    animation: chibiBob 3.6s ease-in-out 0.6s infinite;
-  }
-  @keyframes twinkle {
-    0%, 100% { opacity: 0.72; }
-    50% { opacity: 1; }
-  }
-  .twinkle {
-    animation: twinkle 2.4s ease-in-out infinite;
+    animation: fadeIn 0.65s ease-out 0.1s forwards;
   }
 '''
 
@@ -896,7 +854,7 @@ def main() -> None:
     (DIST_DIR / "profile-combined.svg").write_text(build_combined_svg(stats, yotsugi_uri, shinobu_uri), encoding="utf-8")
 
     print(
-        f"Generated animated SVGs for @{stats['username']}: "
+        f"Generated 60fps all-time SVGs for @{stats['username']}: "
         f"commits={stats['commits']}, stars={stats['stars']}, prs={stats['prs']}, "
         f"streak={stats['streak']}, rank={stats['rank']}"
     )
