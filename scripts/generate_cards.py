@@ -96,24 +96,42 @@ def compute_rank(commits: int, stars: int, prs: int, streak: int) -> str:
 
 def fetch_github_stats(username: str, token: str) -> dict:
     if token:
-        # Step 1: Discover all contribution years + repos + PRs
+        # Step 1: Discover user ID, all contribution years, repos (including org/private), and PRs
         base_query = """
         query($login: String!) {
           user(login: $login) {
+            id
             contributionsCollection {
               contributionYears
             }
             pullRequests(first: 1) {
               totalCount
             }
-            repositories(ownerAffiliations: OWNER, isFork: false, first: 100, orderBy: {field: STARGAZERS, direction: DESC}) {
+            repositories(ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], isFork: false, first: 100, orderBy: {field: PUSHED_AT, direction: DESC}) {
               nodes {
+                nameWithOwner
                 stargazerCount
                 languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
                   edges {
                     size
                     node {
                       name
+                    }
+                  }
+                }
+                defaultBranchRef {
+                  target {
+                    ... on Commit {
+                      history(first: 100) {
+                        nodes {
+                          committedDate
+                          author {
+                            user {
+                              login
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 }
@@ -129,11 +147,23 @@ def fetch_github_stats(username: str, token: str) -> dict:
 
         stars = 0
         lang_sizes: dict[str, int] = {}
+        repo_day_counts: dict[str, int] = {}
+        repo_authored_commits = 0
+        login_lower = username.lower()
         for repo in user["repositories"]["nodes"]:
             stars += repo["stargazerCount"]
             for edge in repo["languages"]["edges"]:
                 name = edge["node"]["name"]
                 lang_sizes[name] = lang_sizes.get(name, 0) + edge["size"]
+            branch = repo.get("defaultBranchRef")
+            if branch and branch.get("target") and branch["target"].get("history"):
+                for cnode in branch["target"]["history"]["nodes"]:
+                    author_user = (cnode.get("author") or {}).get("user")
+                    if author_user and (author_user.get("login") or "").lower() == login_lower:
+                        cdate = (cnode.get("committedDate") or "")[:10]
+                        if cdate:
+                            repo_day_counts[cdate] = repo_day_counts.get(cdate, 0) + 1
+                            repo_authored_commits += 1
 
         total_bytes = sum(lang_sizes.values()) or 1
         top_langs = sorted(lang_sizes.items(), key=lambda kv: kv[1], reverse=True)[:3]
@@ -157,17 +187,23 @@ def fetch_github_stats(username: str, token: str) -> dict:
         years_query = f'query($login: String!) {{ user(login: $login) {{ {" ".join(year_blocks)} }} }}'
         years_data = graphql_query(years_query, {"login": username}, token)["user"]
 
-        total_commits = 0
+        calendar_commits = 0
         day_map: dict[str, int] = {}
         today_iso = dt.date.today().isoformat()
         for y in years:
             cc = years_data[f"y{y}"]
-            total_commits += cc["totalCommitContributions"] + cc["restrictedContributionsCount"]
+            calendar_commits += cc["totalCommitContributions"] + cc["restrictedContributionsCount"]
             for w in cc["contributionCalendar"]["weeks"]:
                 for d in w["contributionDays"]:
                     if d["date"] <= today_iso:
                         day_map[d["date"]] = max(day_map.get(d["date"], 0), d["contributionCount"])
 
+        # Merge private & org repo commits directly into day_map so they are never hidden
+        for cdate, cnt in repo_day_counts.items():
+            if cdate <= today_iso:
+                day_map[cdate] = max(day_map.get(cdate, 0), cnt)
+
+        total_commits = max(calendar_commits, repo_authored_commits)
         all_days = [{"date": k, "count": day_map[k]} for k in sorted(day_map.keys())]
         # Use all-time longest streak if current streak is <= 1 so the card reflects real dedication
         cur_streak = compute_streak(all_days)
