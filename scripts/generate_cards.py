@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Kawaii Pastel Light (Yotsugi) & Cyber Dark (Shinobu) GitHub Profile SVG cards."""
+"""Generate combined animated Kawaii Light (Yotsugi) + Cyber Dark (Shinobu) GitHub Profile SVG."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import html
 import json
 import math
 import os
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -22,8 +21,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 
 
 def b64_png(path: Path) -> str:
-    data = path.read_bytes()
-    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
 
 
 def graphql_query(query: str, variables: dict, token: str) -> dict:
@@ -58,10 +56,8 @@ def rest_get(url: str) -> dict | list:
 
 
 def compute_streak(days: list[dict]) -> int:
-    """Compute current (or most recent active) streak from sorted contribution days."""
     if not days:
         return 0
-    # Walk backwards; allow today to be 0 if user hasn't committed yet today
     streak = 0
     idx = len(days) - 1
     if days[idx]["count"] == 0 and idx > 0:
@@ -71,7 +67,6 @@ def compute_streak(days: list[dict]) -> int:
         idx -= 1
     if streak > 0:
         return streak
-    # If current streak is 0, show longest streak in the past year so card stays motivating
     best = 0
     cur = 0
     for d in days:
@@ -173,7 +168,7 @@ def fetch_github_stats(username: str, token: str) -> dict:
             "days": days,
         }
 
-    # Fallback without GITHUB_TOKEN (e.g. local preview): try public REST API for stars & languages
+    # Local fallback without GITHUB_TOKEN
     stars = 0
     lang_counts: dict[str, int] = {}
     try:
@@ -195,7 +190,6 @@ def fetch_github_stats(username: str, token: str) -> dict:
     else:
         languages = [("TypeScript", 0.48), ("Python", 0.32), ("Go", 0.20)]
 
-    # Build a natural-looking contribution pattern for local preview
     today = dt.date.today()
     days = []
     for i in range(180):
@@ -222,7 +216,6 @@ def fetch_github_stats(username: str, token: str) -> dict:
 
 
 def smooth_wave_path(values: list[float], x0: float, y0: float, w: float, h: float) -> tuple[str, str]:
-    """Return (fill_path, stroke_path) for a smooth cubic Bezier area chart."""
     if not values:
         values = [2, 5, 3, 7, 5, 10, 6, 8]
     vmax = max(values) or 1.0
@@ -230,7 +223,6 @@ def smooth_wave_path(values: list[float], x0: float, y0: float, w: float, h: flo
     pts = []
     for i, v in enumerate(values):
         x = x0 + (w * i / max(1, n - 1))
-        # Leave 16% headroom at top and 10% floor at bottom
         norm = v / vmax
         y = y0 + h - (h * 0.10 + norm * h * 0.74)
         pts.append((x, y))
@@ -247,24 +239,98 @@ def smooth_wave_path(values: list[float], x0: float, y0: float, w: float, h: flo
     return fill_d, stroke_d
 
 
-def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
+def build_odometer_number(
+    uid: str,
+    value_str: str,
+    x: float,
+    y: float,
+    font_size: float,
+    fill: str,
+    align: str = "left",
+    base_delay: float = 0.25,
+    duration: float = 1.35,
+) -> tuple[str, str, str]:
+    """Build pure-CSS odometer count-up from 0 -> target digit for SVG without JS.
+
+    Returns (defs_clips, css_rules, svg_group).
+    """
+    line_h = round(font_size * 1.30, 1)
+    digit_w = round(font_size * 0.62, 1)
+    comma_w = round(font_size * 0.30, 1)
+
+    widths = [digit_w if ch.isdigit() else comma_w for ch in value_str]
+    total_w = sum(widths)
+
+    if align == "center":
+        start_x = x - total_w / 2.0
+    elif align == "right":
+        start_x = x - total_w
+    else:
+        start_x = x
+
+    clips = []
+    css = []
+    parts = []
+    cur_x = start_x
+
+    for idx, ch in enumerate(value_str):
+        cw = widths[idx]
+        if ch.isdigit():
+            target = int(ch)
+            cid = f"clip_{uid}_{idx}"
+            cls = f"od_{uid}_{idx}"
+            # Clip box tightly around one line height
+            clip_y = y - font_size * 0.92
+            clips.append(
+                f'<clipPath id="{cid}">'
+                f'<rect x="{cur_x - 2:.1f}" y="{clip_y:.1f}" width="{cw + 4:.1f}" height="{line_h:.1f}"/>'
+                f"</clipPath>"
+            )
+            dy = round(target * line_h, 1)
+            delay = round(base_delay + idx * 0.08, 2)
+            dur = round(duration + idx * 0.12, 2)
+            if target > 0:
+                css.append(
+                    f"@keyframes k_{cls} {{ 0% {{ transform: translateY(0px); }} 100% {{ transform: translateY(-{dy}px); }} }}\n"
+                    f".{cls} {{ animation: k_{cls} {dur}s cubic-bezier(0.22, 1, 0.36, 1) {delay}s forwards; }}"
+                )
+            else:
+                css.append(
+                    f".{cls} {{ opacity: 1; }}"
+                )
+            digits_svg = "".join(
+                f'<text x="{cur_x + cw / 2:.1f}" y="{y + k * line_h:.1f}" text-anchor="middle" '
+                f'font-size="{font_size}" font-weight="800" fill="{fill}">{k}</text>'
+                for k in range(10)
+            )
+            parts.append(f'<g clip-path="url(#{cid})"><g class="{cls}">{digits_svg}</g></g>')
+        else:
+            parts.append(
+                f'<text x="{cur_x + cw / 2:.1f}" y="{y:.1f}" text-anchor="middle" '
+                f'font-size="{font_size}" font-weight="800" fill="{fill}">{html.escape(ch)}</text>'
+            )
+        cur_x += cw
+
+    return "\n".join(clips), "\n".join(css), "\n".join(parts)
+
+
+def build_light_parts(stats: dict, yotsugi_uri: str, pfx: str = "l_") -> tuple[str, str, str]:
+    """Return (defs, css, body_group) for the 540x620 Light card."""
     user = html.escape(stats["username"])
     commits_str = f"{stats['commits']:,}"
     stars_str = f"{stats['stars']:,}"
     prs_str = f"{stats['prs']:,}"
     streak = stats["streak"]
+    streak_str = str(streak)
 
-    # Grid: 19 cols x 6 rows (114 recent days)
     cols, rows = 19, 6
     recent = stats["days"][-(cols * rows):]
     while len(recent) < cols * rows:
         recent.insert(0, {"date": "", "count": 0})
     max_c = max((d["count"] for d in recent), default=1) or 1
 
-    # Pastel sky-blue -> lavender -> sakura-pink horizontal + intensity coloring
     def cell_color(col: int, count: int) -> str:
         t = col / max(1, cols - 1)
-        # Base horizontal pastel hue: sky blue (#8FD8FF) -> lavender (#C5B6FA) -> sakura pink (#FFA6CC)
         if t < 0.5:
             k = t * 2
             r = int(143 + (197 - 143) * k)
@@ -276,7 +342,6 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
             g = int(182 + (166 - 182) * k)
             b = int(250 + (204 - 250) * k)
         if count == 0:
-            # Very soft pastel tint
             r = int(r * 0.28 + 255 * 0.72)
             g = int(g * 0.28 + 255 * 0.72)
             b = int(b * 0.28 + 255 * 0.72)
@@ -296,11 +361,13 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
         x = gx0 + c * (cell_size + gap)
         y = gy0 + r * (cell_size + gap)
         fill = cell_color(c, d["count"])
+        delay = round(0.05 + c * 0.035, 3)
         grid_rects.append(
-            f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" rx="4.5" fill="{fill}" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="0.6"/>'
+            f'<rect class="cell-pop" style="animation-delay:{delay}s" '
+            f'x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" '
+            f'rx="4.5" fill="{fill}" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="0.6"/>'
         )
 
-    # Top Languages segmented pill bar
     langs = stats["languages"][:3]
     total_ratio = sum(r for _, r in langs) or 1.0
     langs = [(n, r / total_ratio) for n, r in langs]
@@ -316,8 +383,8 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
         cur_x += seg_w
 
     legend_items = []
-    legend_start_x = 122 if len(langs) == 3 else 165
-    step_x = 112
+    legend_start_x = 122 if len(langs) == 3 else (155 if len(langs) == 2 else 225)
+    step_x = 116
     for i, (name, _) in enumerate(langs):
         lx = legend_start_x + i * step_x
         col = lang_colors[i % 3]
@@ -327,46 +394,86 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
             f'<text x="{lx + 11}" y="553" font-size="14" font-weight="600" fill="#2D3248">{safe_name}</text>'
         )
 
-    # Streak ring arc (show full pastel pink-to-blue aesthetic with subtle progress emphasis)
+    # Ring progress animation (from 0 -> target arc on load)
     ring_cx, ring_cy, ring_r = 418, 396, 56
-    circ = 2 * math.pi * ring_r
-    pct = min(1.0, max(0.35, streak / 100.0))
-    dash = circ * pct
+    circ = round(2 * math.pi * ring_r, 1)
+    pct = min(1.0, max(0.32, streak / 100.0))
+    target_offset = round(circ * (1.0 - pct), 1)
 
-    return f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="540" height="620" viewBox="0 0 540 620" fill="none">
-  <defs>
-    <linearGradient id="outerBorder" x1="28" y1="90" x2="512" y2="590" gradientUnits="userSpaceOnUse">
+    # Odometer count-up numbers
+    c_clips, c_css, c_svg = build_odometer_number(f"{pfx}commits", commits_str, 206, 392, 16, "#23273A", "left", 0.20, 1.35)
+    s_clips, s_css, s_svg = build_odometer_number(f"{pfx}stars", stars_str, 206, 421, 16, "#23273A", "left", 0.35, 1.25)
+    p_clips, p_css, p_svg = build_odometer_number(f"{pfx}prs", prs_str, 206, 449, 16, "#23273A", "left", 0.45, 1.30)
+    d_clips, d_css, d_svg = build_odometer_number(f"{pfx}days", streak_str, ring_cx, ring_cy - 2, 27, "#2A2E45", "center", 0.25, 1.45)
+
+    defs = f'''
+    <linearGradient id="{pfx}outerBorder" x1="28" y1="90" x2="512" y2="590" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#87D3FF"/>
       <stop offset="50%" stop-color="#C8B6FF"/>
       <stop offset="100%" stop-color="#FF9CC8"/>
     </linearGradient>
-    <linearGradient id="ringGrad" x1="362" y1="340" x2="474" y2="452" gradientUnits="userSpaceOnUse">
+    <linearGradient id="{pfx}ringGrad" x1="362" y1="340" x2="474" y2="452" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FFA0C9"/>
       <stop offset="50%" stop-color="#C7B6FF"/>
       <stop offset="100%" stop-color="#87D3FF"/>
     </linearGradient>
-    <filter id="cardShadow" x="0" y="70" width="540" height="550" filterUnits="userSpaceOnUse">
+    <filter id="{pfx}cardShadow" x="0" y="70" width="540" height="550" filterUnits="userSpaceOnUse">
       <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#9BB7E8" flood-opacity="0.22"/>
     </filter>
-    <filter id="softBox" x="30" y="140" width="480" height="460" filterUnits="userSpaceOnUse">
+    <filter id="{pfx}softBox" x="30" y="140" width="480" height="460" filterUnits="userSpaceOnUse">
       <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#A6C1EE" flood-opacity="0.16"/>
     </filter>
-    <clipPath id="langPillClip">
+    <clipPath id="{pfx}langPillClip">
       <rect x="{bar_x}" y="{bar_y}" width="{bar_w}" height="{bar_h}" rx="8"/>
     </clipPath>
-    <style>
-      text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Nunito", "Quicksand", Roboto, Helvetica, Arial, sans-serif; }}
-    </style>
-  </defs>
+    {c_clips}
+    {s_clips}
+    {p_clips}
+    {d_clips}
+    '''
 
+    css = f'''
+    @keyframes {pfx}ringGrow {{
+      0% {{ stroke-dashoffset: {circ}; }}
+      100% {{ stroke-dashoffset: {target_offset}; }}
+    }}
+    .{pfx}ring-anim {{
+      stroke-dasharray: {circ};
+      stroke-dashoffset: {circ};
+      animation: {pfx}ringGrow 1.55s cubic-bezier(0.22, 1, 0.36, 1) 0.2s forwards;
+    }}
+    @keyframes {pfx}barGrow {{
+      0% {{ transform: scaleX(0); }}
+      100% {{ transform: scaleX(1); }}
+    }}
+    .{pfx}lang-bar {{
+      transform-box: fill-box;
+      transform-origin: left center;
+      transform: scaleX(0);
+      animation: {pfx}barGrow 1.25s cubic-bezier(0.22, 1, 0.36, 1) 0.35s forwards;
+    }}
+    @keyframes {pfx}cloudDrift {{
+      0%, 100% {{ transform: translateX(0px); }}
+      50% {{ transform: translateX(4px); }}
+    }}
+    .{pfx}cloud-float {{
+      animation: {pfx}cloudDrift 4.2s ease-in-out infinite;
+    }}
+    {c_css}
+    {s_css}
+    {p_css}
+    {d_css}
+    '''
+
+    body = f'''
   <!-- Main Card Base -->
-  <g filter="url(#cardShadow)">
-    <rect x="28" y="96" width="484" height="496" rx="28" fill="#F8FBFF" stroke="url(#outerBorder)" stroke-width="6"/>
+  <g filter="url(#{pfx}cardShadow)">
+    <rect x="28" y="96" width="484" height="496" rx="28" fill="#F8FBFF" stroke="url(#{pfx}outerBorder)" stroke-width="6"/>
   </g>
   <rect x="34" y="102" width="472" height="484" rx="23" fill="none" stroke="#FFFFFF" stroke-width="2"/>
 
-  <!-- Cute Sparkles inside card -->
-  <g opacity="0.85">
+  <!-- Cute Twinkling Sparkles -->
+  <g class="twinkle">
     <path d="M275 130 L277.5 136 L283.5 138.5 L277.5 141 L275 147 L272.5 141 L266.5 138.5 L272.5 136 Z" fill="#FFA3CB"/>
     <path d="M294 118 L295.5 122 L299.5 123.5 L295.5 125 L294 129 L292.5 125 L288.5 123.5 L292.5 122 Z" fill="#89D4FF"/>
     <circle cx="305" cy="140" r="2.2" fill="#C6B4FF"/>
@@ -378,7 +485,7 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
   <text x="56" y="144" font-size="28" font-weight="800" fill="#2A2E45" letter-spacing="-0.3">{user}</text>
 
   <!-- Contribution Heatmap Box -->
-  <g filter="url(#softBox)">
+  <g filter="url(#{pfx}softBox)">
     <rect x="46" y="160" width="448" height="156" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
   </g>
   <g>
@@ -386,7 +493,7 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
   </g>
 
   <!-- Stats Card (Middle Left) -->
-  <g filter="url(#softBox)">
+  <g filter="url(#{pfx}softBox)">
     <rect x="46" y="330" width="286" height="132" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
   </g>
   <text x="66" y="362" font-size="18" font-weight="800" fill="#2A2E45">{user}&apos;s Stats</text>
@@ -397,15 +504,15 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
     <line x1="0" y1="5" x2="3.8" y2="5" stroke="#5B6785" stroke-width="1.8" stroke-linecap="round"/>
     <line x1="12.2" y1="5" x2="16" y2="5" stroke="#5B6785" stroke-width="1.8" stroke-linecap="round"/>
     <text x="26" y="10" font-size="15.5" font-weight="600" fill="#3B4258">Commits:</text>
-    <text x="140" y="10" font-size="16" font-weight="800" fill="#23273A">{commits_str}</text>
   </g>
+  {c_svg}
 
   <!-- Stars row -->
   <g transform="translate(66, 410)">
     <path d="M8 0 L10.2 4.6 L15.2 5.3 L11.6 8.8 L12.5 13.8 L8 11.4 L3.5 13.8 L4.4 8.8 L0.8 5.3 L5.8 4.6 Z" stroke="#5B6785" stroke-width="1.5" fill="#FFF3C4" stroke-linejoin="round"/>
     <text x="26" y="11" font-size="15.5" font-weight="600" fill="#3B4258">Stars:</text>
-    <text x="140" y="11" font-size="16" font-weight="800" fill="#23273A">{stars_str}</text>
   </g>
+  {s_svg}
 
   <!-- PRs row -->
   <g transform="translate(66, 437)">
@@ -415,63 +522,68 @@ def build_light_svg(stats: dict, yotsugi_uri: str) -> str:
     <circle cx="13" cy="13.5" r="2.6" stroke="#5B6785" stroke-width="1.6" fill="none"/>
     <path d="M13 10.8 V6.5 Q13 3.5 10 3.5 H8.5" stroke="#5B6785" stroke-width="1.6" fill="none" stroke-linecap="round"/>
     <text x="26" y="12" font-size="15.5" font-weight="600" fill="#3B4258">PRs:</text>
-    <text x="140" y="12" font-size="16" font-weight="800" fill="#23273A">{prs_str}</text>
   </g>
+  {p_svg}
 
-  <!-- Streak Ring (Middle Right) -->
+  <!-- Animated Streak Ring (Middle Right) -->
   <g>
     <circle cx="{ring_cx}" cy="{ring_cy}" r="{ring_r}" fill="#FFFFFF" stroke="#EEF3FF" stroke-width="13"/>
-    <circle cx="{ring_cx}" cy="{ring_cy}" r="{ring_r}" fill="none" stroke="url(#ringGrad)" stroke-width="13"
-            stroke-linecap="round" stroke-dasharray="{dash:.1f} {circ:.1f}" transform="rotate(-90 {ring_cx} {ring_cy})"/>
-    <text x="{ring_cx}" y="{ring_cy - 2}" text-anchor="middle" font-size="27" font-weight="800" fill="#2A2E45">{streak}</text>
+    <circle class="{pfx}ring-anim" cx="{ring_cx}" cy="{ring_cy}" r="{ring_r}" fill="none" stroke="url(#{pfx}ringGrad)" stroke-width="13"
+            stroke-linecap="round" transform="rotate(-90 {ring_cx} {ring_cy})"/>
+    {d_svg}
     <text x="{ring_cx}" y="{ring_cy + 20}" text-anchor="middle" font-size="15" font-weight="700" fill="#525B76">Days</text>
   </g>
 
   <!-- Top Languages Card (Bottom) -->
-  <g filter="url(#softBox)">
+  <g filter="url(#{pfx}softBox)">
     <rect x="46" y="476" width="448" height="94" rx="16" fill="#FFFFFF" stroke="#D8E7FF" stroke-width="1.5"/>
   </g>
   <text x="66" y="502" font-size="17" font-weight="800" fill="#2A2E45">Top Languages</text>
-  <g clip-path="url(#langPillClip)">
-    {"".join(bar_segments)}
+  <g clip-path="url(#{pfx}langPillClip)">
+    <g class="{pfx}lang-bar">
+      {"".join(bar_segments)}
+    </g>
   </g>
   <g>
     {"".join(legend_items)}
   </g>
 
   <!-- Cute Floating Pastel Clouds -->
-  <g transform="translate(10, 444)">
-    <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
-          fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
-  </g>
-  <g transform="translate(474, 212)">
-    <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
-          fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
-  </g>
-  <g transform="translate(454, 548) scale(1.22)">
-    <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
-          fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.6"/>
+  <g class="{pfx}cloud-float">
+    <g transform="translate(10, 444)">
+      <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
+            fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
+    </g>
+    <g transform="translate(474, 212)">
+      <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
+            fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.8"/>
+    </g>
+    <g transform="translate(454, 548) scale(1.22)">
+      <path d="M12 24 C6 24 2 20 2 15 C2 10.5 5.5 7 10 6.5 C12 2.5 16.5 0 21.5 0 C28 0 33 4.8 33.8 11 C37.5 11.8 40 15 40 18.8 C40 22 37.5 24 34 24 Z"
+            fill="#FFFFFF" stroke="#D7C8FF" stroke-width="1.6"/>
+    </g>
   </g>
 
   <!-- Chibi Yotsugi Ononoki peeking over top-right corner -->
-  <image href="{yotsugi_uri}" x="338" y="0" width="160" height="168" preserveAspectRatio="xMidYMid meet"/>
-</svg>
-'''
+  <g class="chibi-bob">
+    <image href="{yotsugi_uri}" x="338" y="0" width="160" height="168" preserveAspectRatio="xMidYMid meet"/>
+  </g>
+    '''
+    return defs, css, body
 
 
-def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
+def build_dark_parts(stats: dict, shinobu_uri: str, pfx: str = "d_") -> tuple[str, str, str]:
+    """Return (defs, css, body_group) for the 540x620 Dark card."""
     user = html.escape(stats["username"])
-    streak = stats["streak"]
+    streak_str = str(stats["streak"])
     rank = html.escape(stats["rank"])
 
-    # Grid: 19 cols x 6 rows
     cols, rows = 19, 6
     recent = stats["days"][-(cols * rows):]
     while len(recent) < cols * rows:
         recent.insert(0, {"date": "", "count": 0})
     max_c = max((d["count"] for d in recent), default=1) or 1
 
-    # Snake occupies a cute winding path across the middle of the grid
     snake_cells = {
         (7, 2), (8, 2), (8, 3), (9, 3), (10, 3), (11, 3), (12, 3), (12, 2), (13, 2)
     }
@@ -497,6 +609,7 @@ def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
         r = idx % rows
         x = gx0 + c * (cell_size + gap)
         y = gy0 + r * (cell_size + gap)
+        delay = round(0.08 + c * 0.035, 3)
         if (c, r) in snake_cells:
             grid_rects.append(
                 f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" rx="4" fill="#242339" opacity="0.9"/>'
@@ -504,10 +617,10 @@ def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
             continue
         fill, op = dark_cell_color(c, d["count"])
         grid_rects.append(
-            f'<rect x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" rx="4" fill="{fill}" opacity="{op:.2f}"/>'
+            f'<rect class="cell-pop" style="animation-delay:{delay}s" '
+            f'x="{x:.1f}" y="{y:.1f}" width="{cell_size:.1f}" height="{cell_size:.1f}" rx="4" fill="{fill}" fill-opacity="{op:.2f}"/>'
         )
 
-    # Compute snake visual path coordinates on the grid
     def cell_center(c: int, r: int) -> tuple[float, float]:
         return (gx0 + c * (cell_size + gap) + cell_size / 2, gy0 + r * (cell_size + gap) + cell_size / 2)
 
@@ -516,7 +629,6 @@ def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
     head_x, head_y = cell_center(7, 2)
     food_x, food_y = cell_center(5, 2)
 
-    # Wave graph: group last 98 days into 14 weekly buckets
     wave_days = stats["days"][-98:]
     buckets = []
     step = max(1, len(wave_days) // 14)
@@ -530,7 +642,6 @@ def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
     wx0, wy0, ww, wh = 62, 412, 416, 146
     fill_d, stroke_d = smooth_wave_path(buckets, wx0, wy0, ww, wh)
 
-    # Subtle grid lines for wave chart
     chart_grid = []
     for i in range(1, 5):
         gy = wy0 + wh * i / 5
@@ -539,70 +650,99 @@ def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
         gx = wx0 + ww * i / 8
         chart_grid.append(f'<line x1="{gx:.1f}" y1="{wy0}" x2="{gx:.1f}" y2="{wy0 + wh}" stroke="#2A2945" stroke-width="1"/>')
 
-    return f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="540" height="620" viewBox="0 0 540 620" fill="none">
-  <defs>
-    <linearGradient id="neonBorder" x1="28" y1="96" x2="512" y2="592" gradientUnits="userSpaceOnUse">
+    # Odometer count-up for STREAK pill number
+    st_clips, st_css, st_svg = build_odometer_number(f"{pfx}streak", streak_str, 192, 375, 19, "#FF8CD0", "left", 0.30, 1.40)
+
+    defs = f'''
+    <linearGradient id="{pfx}neonBorder" x1="28" y1="96" x2="512" y2="592" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FF78C4"/>
       <stop offset="50%" stop-color="#B892FF"/>
       <stop offset="100%" stop-color="#6BE5FF"/>
     </linearGradient>
-    <linearGradient id="waveFill" x1="62" y1="440" x2="478" y2="540" gradientUnits="userSpaceOnUse">
+    <linearGradient id="{pfx}waveFill" x1="62" y1="440" x2="478" y2="540" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FF78C4" stop-opacity="0.72"/>
       <stop offset="50%" stop-color="#B992FF" stop-opacity="0.65"/>
       <stop offset="100%" stop-color="#6BE5FF" stop-opacity="0.75"/>
     </linearGradient>
-    <linearGradient id="waveStroke" x1="62" y1="0" x2="478" y2="0" gradientUnits="userSpaceOnUse">
+    <linearGradient id="{pfx}waveStroke" x1="62" y1="0" x2="478" y2="0" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#FF8ED0"/>
       <stop offset="50%" stop-color="#D2B6FF"/>
       <stop offset="100%" stop-color="#8AF0FF"/>
     </linearGradient>
-    <filter id="neonGlow" x="-10%" y="-10%" width="120%" height="120%">
-      <feGaussianBlur stdDeviation="4" result="blur"/>
+    <filter id="{pfx}neonGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
       </feMerge>
     </filter>
-    <filter id="cardGlow" x="0" y="70" width="540" height="550" filterUnits="userSpaceOnUse">
+    <filter id="{pfx}cardGlow" x="0" y="70" width="540" height="550" filterUnits="userSpaceOnUse">
       <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#FF78C4" flood-opacity="0.18"/>
     </filter>
-    <style>
-      text {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Nunito", Roboto, Helvetica, Arial, sans-serif; }}
-      .snake-float {{
-        animation: snakeBob 2.6s ease-in-out infinite;
-      }}
-      .food-pulse {{
-        animation: foodPulse 1.6s ease-in-out infinite;
-        transform-origin: {food_x:.1f}px {food_y:.1f}px;
-      }}
-      @keyframes snakeBob {{
-        0%, 100% {{ transform: translateX(0px); }}
-        50% {{ transform: translateX(-4px); }}
-      }}
-      @keyframes foodPulse {{
-        0%, 100% {{ opacity: 0.7; transform: scale(0.92); }}
-        50% {{ opacity: 1; transform: scale(1.12); }}
-      }}
-    </style>
-  </defs>
+    {st_clips}
+    '''
 
+    css = f'''
+    @keyframes {pfx}snakeBob {{
+      0%, 100% {{ transform: translateX(0px); }}
+      50% {{ transform: translateX(-5px); }}
+    }}
+    .{pfx}snake-float {{
+      animation: {pfx}snakeBob 2.4s ease-in-out infinite;
+    }}
+    @keyframes {pfx}foodPulse {{
+      0%, 100% {{ opacity: 0.65; transform: scale(0.90); }}
+      50% {{ opacity: 1; transform: scale(1.15); }}
+    }}
+    .{pfx}food-pulse {{
+      transform-box: fill-box;
+      transform-origin: center;
+      animation: {pfx}foodPulse 1.5s ease-in-out infinite;
+    }}
+    @keyframes {pfx}waveDraw {{
+      0% {{ stroke-dashoffset: 900; }}
+      100% {{ stroke-dashoffset: 0; }}
+    }}
+    .{pfx}wave-stroke {{
+      stroke-dasharray: 900;
+      stroke-dashoffset: 900;
+      animation: {pfx}waveDraw 1.65s cubic-bezier(0.22, 1, 0.36, 1) 0.3s forwards;
+    }}
+    @keyframes {pfx}waveFade {{
+      0% {{ opacity: 0; }}
+      100% {{ opacity: 1; }}
+    }}
+    .{pfx}wave-area {{
+      opacity: 0;
+      animation: {pfx}waveFade 1.2s ease-out 0.65s forwards;
+    }}
+    @keyframes {pfx}rankPop {{
+      0% {{ opacity: 0; transform: scale(0.6); }}
+      70% {{ opacity: 1; transform: scale(1.12); }}
+      100% {{ opacity: 1; transform: scale(1); }}
+    }}
+    .{pfx}rank-pop {{
+      transform-box: fill-box;
+      transform-origin: center;
+      opacity: 0;
+      animation: {pfx}rankPop 0.75s cubic-bezier(0.22, 1, 0.36, 1) 0.75s forwards;
+    }}
+    {st_css}
+    '''
+
+    body = f'''
   <!-- Main Dark Neon Card Base -->
-  <g filter="url(#cardGlow)">
-    <rect x="28" y="96" width="484" height="496" rx="28" fill="#151426" stroke="url(#neonBorder)" stroke-width="5"/>
+  <g filter="url(#{pfx}cardGlow)">
+    <rect x="28" y="96" width="484" height="496" rx="28" fill="#151426" stroke="url(#{pfx}neonBorder)" stroke-width="5"/>
   </g>
   <rect x="36" y="104" width="468" height="480" rx="22" fill="none" stroke="#2D2B4B" stroke-width="1.2"/>
 
   <!-- Cute Neon Pixel Hearts & Sparkles -->
-  <g filter="url(#neonGlow)">
-    <!-- Top-left pink heart -->
+  <g class="twinkle" filter="url(#{pfx}neonGlow)">
     <path d="M56 125 C56 121 50 120 50 125 C50 129 56 134 56 134 C56 134 62 129 62 125 C62 120 56 121 56 125 Z" fill="#FF7AC6"/>
-    <!-- Cyan heart near Shinobu -->
     <path d="M322 124 C322 120.5 317 120 317 124 C317 127.5 322 131.5 322 131.5 C322 131.5 327 127.5 327 124 C327 120 322 120.5 322 124 Z" fill="none" stroke="#6BE5FF" stroke-width="1.8"/>
-    <!-- Right-side pink outline heart -->
     <path d="M494 318 C494 314.5 489 314 489 318 C489 321.5 494 325.5 494 325.5 C494 325.5 499 321.5 499 318 C499 314 494 314.5 494 318 Z" fill="none" stroke="#FF7AC6" stroke-width="1.8"/>
-    <!-- Left-side pink outline heart -->
     <path d="M44 374 C44 370.5 39 370 39 374 C39 377.5 44 381.5 44 381.5 C44 381.5 49 377.5 49 374 C49 370 44 370.5 44 374 Z" fill="none" stroke="#FF7AC6" stroke-width="1.8"/>
-    <!-- Bottom-right cyan heart -->
     <path d="M494 562 C494 558.5 489 558 489 562 C489 565.5 494 569.5 494 569.5 C494 569.5 499 565.5 499 562 C499 558 494 558.5 494 562 Z" fill="none" stroke="#6BE5FF" stroke-width="1.8"/>
   </g>
   <circle cx="48" cy="147" r="2.8" fill="#6BE5FF"/>
@@ -619,20 +759,17 @@ def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
   </g>
 
   <!-- Glowing Food Dot -->
-  <g class="food-pulse" filter="url(#neonGlow)">
+  <g class="{pfx}food-pulse" filter="url(#{pfx}neonGlow)">
     <rect x="{food_x - 6:.1f}" y="{food_y - 6:.1f}" width="12" height="12" rx="3.5" fill="#74E8FF"/>
   </g>
 
   <!-- Animated Cute Pink Pixel Snake -->
-  <g class="snake-float" filter="url(#neonGlow)">
+  <g class="{pfx}snake-float" filter="url(#{pfx}neonGlow)">
     <path d="{snake_path}" stroke="#FF88CC" stroke-width="15" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
     <path d="{snake_path}" stroke="#FFB8E2" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 10" fill="none"/>
-    <!-- Snake Head -->
     <circle cx="{head_x:.1f}" cy="{head_y:.1f}" r="9.5" fill="#FF88CC"/>
-    <!-- Cute Eyes -->
     <circle cx="{head_x - 3:.1f}" cy="{head_y - 2.5:.1f}" r="1.8" fill="#151426"/>
     <circle cx="{head_x - 3:.1f}" cy="{head_y + 2.5:.1f}" r="1.8" fill="#151426"/>
-    <!-- Tiny Tongue -->
     <path d="M{head_x - 9.5:.1f} {head_y:.1f} L{head_x - 15:.1f} {head_y:.1f} M{head_x - 15:.1f} {head_y:.1f} L{head_x - 18:.1f} {head_y - 2.5:.1f} M{head_x - 15:.1f} {head_y:.1f} L{head_x - 18:.1f} {head_y + 2.5:.1f}"
           stroke="#FF5CA8" stroke-width="1.8" stroke-linecap="round"/>
   </g>
@@ -641,31 +778,105 @@ def build_dark_svg(stats: dict, shinobu_uri: str) -> str:
   <text x="64" y="336" font-size="13" font-weight="600" fill="#7D83A8">@{user}</text>
 
   <!-- STREAK Pill -->
-  <g filter="url(#neonGlow)">
+  <g filter="url(#{pfx}neonGlow)">
     <rect x="60" y="346" width="202" height="44" rx="22" fill="#17162B" stroke="#FF7AC6" stroke-width="2.2"/>
   </g>
-  <text x="161" y="375" text-anchor="middle" font-size="19" font-weight="800" fill="#E8F8FF" letter-spacing="0.5">
-    STREAK: <tspan fill="#FF8CD0">{streak}</tspan>
-  </text>
+  <text x="184" y="375" text-anchor="end" font-size="19" font-weight="800" fill="#E8F8FF" letter-spacing="0.5">STREAK:</text>
+  {st_svg}
 
   <!-- RANK Pill -->
-  <g filter="url(#neonGlow)">
+  <g filter="url(#{pfx}neonGlow)">
     <rect x="278" y="346" width="202" height="44" rx="22" fill="#17162B" stroke="#6BE5FF" stroke-width="2.2"/>
   </g>
-  <text x="379" y="375" text-anchor="middle" font-size="19" font-weight="800" fill="#E8F8FF" letter-spacing="0.5">
-    RANK: <tspan fill="#7AEBFF">{rank}</tspan>
-  </text>
+  <text x="382" y="375" text-anchor="end" font-size="19" font-weight="800" fill="#E8F8FF" letter-spacing="0.5">RANK:</text>
+  <text class="{pfx}rank-pop" x="392" y="375" text-anchor="start" font-size="19" font-weight="800" fill="#7AEBFF">{rank}</text>
 
   <!-- Bottom Wave Graph Container -->
   <rect x="48" y="404" width="444" height="162" rx="16" fill="#0E0E1D" stroke="#2D2B4B" stroke-width="1.5"/>
   <g>
     {"".join(chart_grid)}
   </g>
-  <path d="{fill_d}" fill="url(#waveFill)"/>
-  <path d="{stroke_d}" stroke="url(#waveStroke)" stroke-width="3.5" stroke-linecap="round" filter="url(#neonGlow)" fill="none"/>
+  <path class="{pfx}wave-area" d="{fill_d}" fill="url(#{pfx}waveFill)"/>
+  <path class="{pfx}wave-stroke" d="{stroke_d}" stroke="url(#{pfx}waveStroke)" stroke-width="3.5" stroke-linecap="round" filter="url(#{pfx}neonGlow)" fill="none"/>
 
   <!-- Chibi Shinobu Oshino peeking over top-right corner -->
-  <image href="{shinobu_uri}" x="348" y="10" width="158" height="152" preserveAspectRatio="xMidYMid meet"/>
+  <g class="chibi-bob-alt">
+    <image href="{shinobu_uri}" x="348" y="10" width="158" height="152" preserveAspectRatio="xMidYMid meet"/>
+  </g>
+    '''
+    return defs, css, body
+
+
+SHARED_CSS = '''
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Nunito", "Quicksand", Roboto, Helvetica, Arial, sans-serif; }
+  @keyframes cellPop {
+    0% { opacity: 0; }
+    100% { opacity: 1; }
+  }
+  .cell-pop {
+    opacity: 0;
+    animation: cellPop 0.55s ease-out forwards;
+  }
+  @keyframes chibiBob {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-3.5px); }
+  }
+  .chibi-bob {
+    animation: chibiBob 3.2s ease-in-out infinite;
+  }
+  .chibi-bob-alt {
+    animation: chibiBob 3.6s ease-in-out 0.6s infinite;
+  }
+  @keyframes twinkle {
+    0%, 100% { opacity: 0.72; }
+    50% { opacity: 1; }
+  }
+  .twinkle {
+    animation: twinkle 2.4s ease-in-out infinite;
+  }
+'''
+
+
+def wrap_single_svg(defs: str, css: str, body: str) -> str:
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="540" height="620" viewBox="0 0 540 620" fill="none">
+  <defs>
+    {defs}
+    <style>
+      {SHARED_CSS}
+      {css}
+    </style>
+  </defs>
+  {body}
+</svg>
+'''
+
+
+def build_combined_svg(stats: dict, yotsugi_uri: str, shinobu_uri: str) -> str:
+    l_defs, l_css, l_body = build_light_parts(stats, yotsugi_uri, pfx="l_")
+    d_defs, d_css, d_body = build_dark_parts(stats, shinobu_uri, pfx="d_")
+
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1156" height="660" viewBox="0 0 1156 660" fill="none">
+  <defs>
+    {l_defs}
+    {d_defs}
+    <style>
+      {SHARED_CSS}
+      {l_css}
+      {d_css}
+    </style>
+  </defs>
+
+  <!-- Left Rounded Light Panel Backdrop -->
+  <rect x="0" y="0" width="566" height="660" rx="28" fill="#FFFFFF" stroke="#E5ECF8" stroke-width="1.5"/>
+  <g transform="translate(13, 20)">
+    {l_body}
+  </g>
+
+  <!-- Right Rounded Dark Panel Backdrop -->
+  <rect x="590" y="0" width="566" height="660" rx="28" fill="#0D1117" stroke="#222638" stroke-width="1.5"/>
+  <g transform="translate(603, 20)">
+    {d_body}
+  </g>
 </svg>
 '''
 
@@ -677,13 +888,15 @@ def main() -> None:
     yotsugi_uri = b64_png(ASSETS_DIR / "yotsugi-light.png")
     shinobu_uri = b64_png(ASSETS_DIR / "shinobu-dark.png")
 
-    light_svg = build_light_svg(stats, yotsugi_uri)
-    dark_svg = build_dark_svg(stats, shinobu_uri)
+    l_defs, l_css, l_body = build_light_parts(stats, yotsugi_uri, pfx="l_")
+    d_defs, d_css, d_body = build_dark_parts(stats, shinobu_uri, pfx="d_")
 
-    (DIST_DIR / "profile-light.svg").write_text(light_svg, encoding="utf-8")
-    (DIST_DIR / "profile-dark.svg").write_text(dark_svg, encoding="utf-8")
+    (DIST_DIR / "profile-light.svg").write_text(wrap_single_svg(l_defs, l_css, l_body), encoding="utf-8")
+    (DIST_DIR / "profile-dark.svg").write_text(wrap_single_svg(d_defs, d_css, d_body), encoding="utf-8")
+    (DIST_DIR / "profile-combined.svg").write_text(build_combined_svg(stats, yotsugi_uri, shinobu_uri), encoding="utf-8")
+
     print(
-        f"Generated SVGs for @{stats['username']}: "
+        f"Generated animated SVGs for @{stats['username']}: "
         f"commits={stats['commits']}, stars={stats['stars']}, prs={stats['prs']}, "
         f"streak={stats['streak']}, rank={stats['rank']}"
     )
