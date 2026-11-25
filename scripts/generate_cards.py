@@ -205,7 +205,7 @@ def fetch_github_stats(username: str, token: str) -> dict:
 
         total_commits = max(calendar_commits, repo_authored_commits)
         all_days = [{"date": k, "count": day_map[k]} for k in sorted(day_map.keys())]
-        # Use all-time longest streak if current streak is <= 1 so the card reflects real dedication
+        # Always show all-time longest streak so it never drops backwards when starting a new streak
         cur_streak = compute_streak(all_days)
         best_streak = 0
         run = 0
@@ -215,7 +215,7 @@ def fetch_github_stats(username: str, token: str) -> dict:
                 best_streak = max(best_streak, run)
             else:
                 run = 0
-        display_streak = cur_streak if cur_streak >= 2 else best_streak
+        display_streak = max(cur_streak, best_streak)
 
         rank = compute_rank(total_commits, stars, prs, display_streak)
         return {
